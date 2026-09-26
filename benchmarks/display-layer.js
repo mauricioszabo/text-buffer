@@ -432,6 +432,41 @@ async function main () {
       return n
     }))
 
+  add(await measure('long-line-typing-wrapped',
+    () => {
+      const ctx = createEditorBuffer(longLineText, {softWrapColumn: 120})
+      ctx.displayLayer.getScreenLines(0, VIEWPORT)
+      return ctx
+    },
+    ({buffer, displayLayer}) => {
+      // Type in the middle of the line, rendering the viewport each time.
+      let column = Math.floor(buffer.lineLengthForRow(0) / 2)
+      const screenRow = displayLayer.translateBufferPosition(Point(0, column)).row
+      for (let i = 0; i < 100; i++) {
+        buffer.setTextInRange(Range(Point(0, column), Point(0, column)), 'x')
+        column++
+        displayLayer.getScreenLines(screenRow - 30, screenRow + 30)
+      }
+      return 100
+    }))
+
+  add(await measure('long-line-row-translation',
+    () => {
+      const ctx = createEditorBuffer(longLineText, {softWrapColumn: 120})
+      ctx.displayLayer.getScreenLineCount()
+      return ctx
+    },
+    ({displayLayer}) => {
+      // What decoration queries do each frame: map every visible screen row
+      // back to a buffer range.
+      const start = Math.floor(displayLayer.getScreenLineCount() / 2)
+      for (let row = start; row < start + 1000; row++) {
+        displayLayer.translateScreenPosition(Point(row, 0))
+        displayLayer.translateScreenPosition(Point(row, Infinity))
+      }
+      return 2000
+    }))
+
   add(await measure('folds-500',
     () => {
       const ctx = createEditorBuffer(largeText)

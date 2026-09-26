@@ -889,6 +889,29 @@ describe('DisplayLayer', () => {
       expect(JSON.stringify(displayLayer.getText())).toBe(JSON.stringify('abc \ndef     '))
     })
 
+    it('builds screen lines starting in the middle of a soft-wrapped line like a full build', () => {
+      const buffer = new TextBuffer({text: 'ab\tcd ' + 'lorem ipsum dolor sit amet '.repeat(40) + '\nnext line'})
+      const params = {softWrapColumn: 17, softWrapHangingIndent: 2, showIndentGuides: true, invisibles: {space: '•', eol: '¬'}}
+      buffer.setLanguageMode(new TestLanguageMode([['a', [[0, 3], [0, 300]]], ['b', [[0, 100], [1, 2]]]], null, () => 0))
+      const displayLayer = buffer.addDisplayLayer(params)
+      displayLayer.getScreenLines(0, 10)
+
+      // Built-in scope ids depend on the order a layer first uses them, so
+      // compare class names.
+      const describe = (layer, lines) => lines.map(({lineText, tags}) => ({
+        lineText,
+        tags: tags.map((tag) => layer.isOpenTag(tag) ? '<' + layer.classNameForTag(tag) + '>' : layer.isCloseTag(tag) ? '</>' : tag)
+      }))
+
+      buffer.setTextInRange([[0, 150], [0, 150]], 'x')
+      const fresh = buffer.addDisplayLayer(params)
+      const expected = describe(fresh, fresh.getScreenLines(0, fresh.getScreenLineCount()))
+      expect(expected.length).toBeGreaterThan(40)
+      for (const start of [5, 20, 33]) {
+        expect(describe(displayLayer, displayLayer.getScreenLines(start, start + 7))).toEqual(expected.slice(start, start + 7))
+      }
+    })
+
     it('re-expands tabs on soft-wrapped lines', () => {
       const buffer = new TextBuffer({
         text: 'fah\t\t\tcodexelectric valence\t ble'
