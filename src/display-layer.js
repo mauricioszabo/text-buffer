@@ -481,7 +481,9 @@ class DisplayLayer {
   // builder; the iterator stays stuck on it and gets re-seeked at the start
   // of the next row, so we record a "reseek" segment there.
   collectHighlightBatch (segments) {
-    const endBufferRow = segments[0]
+    // An unbounded end (e.g. `getScreenLines(row, Infinity)`) comes through
+    // the Int32Array as a negative number.
+    const endBufferRow = segments[0] < 0 ? Infinity : segments[0]
     const iterator = this.buffer.languageMode.buildHighlightIterator()
     const data = [0]
     let segmentCount = 0

@@ -2598,7 +2598,10 @@ Object.assign(TextBuffer, {
   Point: Point,
   Range: Range,
   newlineRegex: newlineRegex,
-  spliceArray: spliceArray
+  spliceArray: spliceArray,
+  // The superstring module this buffer's native TextBuffer comes from, for
+  // native code that must work with it (e.g. native Tree-sitter parsing).
+  superstring: require('@pulsar-edit/superstring')
 })
 
 Object.assign(TextBuffer.prototype, {

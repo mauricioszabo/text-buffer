@@ -2152,6 +2152,15 @@ describe('DisplayLayer', () => {
       ])
     })
 
+    it('highlights screen lines requested up to an unbounded end row', () => {
+      const buffer = new TextBuffer({text: 'abc\ndef'})
+      const displayLayer = buffer.addDisplayLayer({})
+      buffer.setLanguageMode(new TestLanguageMode([['a', [[0, 1], [1, 2]]]]))
+      const [first, second] = displayLayer.getScreenLines(0, Infinity)
+      expect(first.tags.map((tag) => displayLayer.isOpenTag(tag) ? displayLayer.classNameForTag(tag) : tag)).toEqual([1, 'a', 2, -258])
+      expect(second.tags.map((tag) => displayLayer.isOpenTag(tag) ? displayLayer.classNameForTag(tag) : tag)).toEqual(['a', 2, -258, 1])
+    })
+
     it('gracefully handles the text decoration iterator reporting decoration boundaries beyond the end of a line', () => {
       const buffer = new TextBuffer({
         text: 'abc\ndef'
