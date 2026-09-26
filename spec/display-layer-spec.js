@@ -912,6 +912,77 @@ describe('DisplayLayer', () => {
       }
     })
 
+    it('re-wraps only the affected part of a long line when editing within it', () => {
+      const displayLayer = new TextBuffer({text: 'a'}).addDisplayLayer({})
+      const buffer = displayLayer.buffer
+      buffer.setText('  ' + 'lorem ipsum dolor sit amet '.repeat(200) + '\nshort line')
+      const wrapped = buffer.addDisplayLayer({softWrapColumn: 30, softWrapHangingIndent: 2})
+      wrapped.getScreenLineCount()
+      const changes = []
+      wrapped.onDidChange((events) => changes.push(...events))
+      buffer.insert([0, 2000], 'x')
+      expect(changes.length).toBe(1)
+      expect(changes[0].oldRange.end.row - changes[0].oldRange.start.row).toBeLessThan(5)
+      expect(displayLayer.isDestroyed()).toBe(false)
+    })
+
+    it('keeps long soft-wrapped lines consistent with a full re-wrap after random edits within them', () => {
+      const now = Date.now()
+      const words = ['lorem', 'ipsum', '\t', 'dolor', '中文字', 'ｶﾀｶﾅ', '한국어', 'é', '😀', 'sit', '-amet', '/path/', '  ']
+      for (let i = 0; i < 20; i++) {
+        const seed = now + i
+        const random = new Random(seed)
+        const lines = []
+        for (let row = 0; row < 3; row++) {
+          let line = random(3) === 0 ? '\t ' : '  '
+          const length = random.intBetween(50, 400)
+          while (line.length < length) line += words[random(words.length)] + (random(3) ? ' ' : '')
+          lines.push(line)
+        }
+        const buffer = new TextBuffer({text: lines.join('\n')})
+        const params = {
+          softWrapColumn: random.intBetween(8, 40),
+          softWrapHangingIndent: random(3),
+          tabLength: random.intBetween(2, 5),
+          characterWidthRatios: {doubleWidth: 2, halfWidth: 0.5, korean: 1.5},
+          wrapBoundaryMode: 'cjk',
+          invisibles: random(2) ? {space: '•', tab: '»'} : {}
+        }
+        const displayLayer = buffer.addDisplayLayer(params)
+        displayLayer.getScreenLineCount()
+
+        for (let j = 0; j < 30; j++) {
+          const row = random(buffer.getLineCount())
+          const lineLength = buffer.lineLengthForRow(row)
+          const start = random(lineLength + 1)
+          const end = Math.min(lineLength, start + random(4))
+          const text = random(4) ? words[random(words.length)] : ''
+          buffer.setTextInRange([[row, start], [row, end]], text)
+          displayLayer.getScreenLines(random(displayLayer.getScreenLineCount()), displayLayer.getScreenLineCount())
+
+          const freshDisplayLayer = buffer.addDisplayLayer(params)
+          const expected = freshDisplayLayer.getScreenLines().map((line) => line.lineText)
+          const actual = displayLayer.getScreenLines().map((line) => line.lineText)
+          expect(actual).toEqual(expected, `Seed: ${seed}, edit ${j}`)
+          // Rows tied for the longest may be reported differently; the width
+          // is what matters.
+          const rightmost = displayLayer.getRightmostScreenPosition()
+          expect(rightmost.column).toBe(freshDisplayLayer.getRightmostScreenPosition().column, `Seed: ${seed}`)
+          expect(displayLayer.lineLengthForScreenRow(rightmost.row)).toBe(rightmost.column, `Seed: ${seed}`)
+          for (let k = 0; k < 10; k++) {
+            const screenRow = random(expected.length)
+            const screenPosition = Point(screenRow, random(expected[screenRow].length + 1))
+            expect(displayLayer.translateScreenPosition(screenPosition)).toEqual(freshDisplayLayer.translateScreenPosition(screenPosition), `Seed: ${seed}`)
+            const bufferRow = random(buffer.getLineCount())
+            const bufferPosition = Point(bufferRow, random(buffer.lineLengthForRow(bufferRow) + 1))
+            expect(displayLayer.translateBufferPosition(bufferPosition)).toEqual(freshDisplayLayer.translateBufferPosition(bufferPosition), `Seed: ${seed}`)
+          }
+          freshDisplayLayer.destroy()
+          if (jasmine.getEnv().currentSpec && jasmine.getEnv().currentSpec.results().failedCount > 0) return
+        }
+      }
+    })
+
     it('re-expands tabs on soft-wrapped lines', () => {
       const buffer = new TextBuffer({
         text: 'fah\t\t\tcodexelectric valence\t ble'

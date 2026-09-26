@@ -596,7 +596,11 @@ class DisplayLayer {
   }
 
   bufferDidChange ({oldRange, newRange}) {
-    this.nativeDisplayLayer.bufferDidChange(oldRange.start.row, oldRange.end.row, newRange.end.row)
+    this.nativeDisplayLayer.bufferDidChange(
+      oldRange.start.row, oldRange.start.column,
+      oldRange.end.row, oldRange.end.column,
+      newRange.end.row, newRange.end.column
+    )
     this.didChange(this.readScreenChange())
   }
 
