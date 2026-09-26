@@ -391,22 +391,52 @@ class DisplayLayer {
   }
 
   getScreenLines (screenStartRow = 0, screenEndRow = this.getScreenLineCount()) {
+    const result = this.buildScreenLinesWith(screenStartRow, screenEndRow, (highlightBatch, knownIds, strict) =>
+      this.nativeDisplayLayer.buildScreenLines(screenStartRow, screenEndRow, highlightBatch, knownIds, strict)
+    )
+    return this.decodeScreenLines(screenStartRow, result)
+  }
+
+  // Creates a planner that tracks what one viewer rendered, so that
+  // `buildRenderPlan` can report only the lines that changed.
+  createRenderPlanner () {
+    return new RenderPlanner(this)
+  }
+
+  // Runs a native screen-line build, collecting highlighting first. The
+  // build may ask to be retried when highlighting was invalidated while we
+  // collected it (a language mode may tokenize lazily), or when class names
+  // for new scopes must be registered first.
+  buildScreenLinesWith (screenStartRow, screenEndRow, build) {
     let result
-    // Highlighting can be invalidated while we collect it (a language mode
-    // may tokenize lazily); retry, and finally accept what we have.
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 3;) {
       const segments = this.nativeDisplayLayer.prepareScreenLines(screenStartRow, screenEndRow)
       const highlightBatch = segments ? this.collectHighlightBatch(segments) : null
-      result = this.nativeDisplayLayer.buildScreenLines(
-        screenStartRow,
-        screenEndRow,
+      result = build(
         highlightBatch,
         this.getKnownScreenLineIds(screenStartRow, screenEndRow),
         attempt < 2
       )
-      if (result) break
+      if (result instanceof Int32Array) {
+        this.registerClassNames(result)
+      } else if (result) {
+        return result
+      } else {
+        attempt++
+      }
     }
+    return result
+  }
 
+  registerClassNames (scopeIds) {
+    const classNames = new Array(scopeIds.length)
+    for (let i = 0; i < scopeIds.length; i++) {
+      classNames[i] = this.classNameForScopeId(scopeIds[i]) || ''
+    }
+    this.nativeDisplayLayer.setClassNames(scopeIds, classNames)
+  }
+
+  decodeScreenLines (screenStartRow, result) {
     const [ids, dataIndexes, texts, tagOffsets, tags, softWrapIndents, newBuiltInScopes] = result
     if (newBuiltInScopes) this.registerBuiltInScopes(newBuiltInScopes)
 
@@ -691,6 +721,53 @@ class DisplayLayer {
   }
 }
 
+// Tracks the screen lines one viewer rendered and describes, for each new
+// viewport, how to get there from the previous one.
+class RenderPlanner {
+  constructor (displayLayer) {
+    this.displayLayer = displayLayer
+    this.id = displayLayer.nativeDisplayLayer.createRenderPlanner()
+  }
+
+  // Returns {screenLines, ops, htmlByScreenLineId}:
+  //
+  // * `screenLines` are the screen lines for the rows, as `getScreenLines`
+  //   returns them.
+  // * `ops` is a Uint32Array of (op, screenLineId, screenRow, oldScreenLineId)
+  //   quadruples, where op is one of RenderPlanner.KEEP, INSERT, REPLACE (the
+  //   new line takes the place of `oldScreenLineId`), MOVE or REMOVE.
+  // * `htmlByScreenLineId` holds the contents of the line element for every
+  //   inserted or replaced line.
+  buildRenderPlan (screenStartRow, screenEndRow) {
+    const displayLayer = this.displayLayer
+    const result = displayLayer.buildScreenLinesWith(screenStartRow, screenEndRow, (highlightBatch, knownIds, strict) =>
+      displayLayer.nativeDisplayLayer.buildRenderPlan(this.id, screenStartRow, screenEndRow, highlightBatch, knownIds, strict)
+    )
+    const screenLines = displayLayer.decodeScreenLines(screenStartRow, result)
+    const htmlLineIds = result[8]
+    const html = result[9]
+    const htmlByScreenLineId = new Map()
+    for (let i = 0; i < htmlLineIds.length; i++) htmlByScreenLineId.set(htmlLineIds[i], html[i])
+    return {screenLines, ops: result[7], htmlByScreenLineId}
+  }
+
+  // Forget what was rendered, so the next plan inserts every line.
+  reset () {
+    this.displayLayer.nativeDisplayLayer.destroyRenderPlanner(this.id)
+    this.id = this.displayLayer.nativeDisplayLayer.createRenderPlanner()
+  }
+
+  destroy () {
+    this.displayLayer.nativeDisplayLayer.destroyRenderPlanner(this.id)
+  }
+}
+
+RenderPlanner.KEEP = 0
+RenderPlanner.INSERT = 1
+RenderPlanner.REPLACE = 2
+RenderPlanner.MOVE = 3
+RenderPlanner.REMOVE = 4
+
 function clipDirectionCode (options) {
   const code = options && CLIP_DIRECTION_CODES[options.clipDirection]
   return code != null ? code : 0
@@ -737,5 +814,7 @@ function isWordStart (previousCharacter, character) {
 function unitRatio () {
   return 1
 }
+
+DisplayLayer.RenderPlanner = RenderPlanner
 
 module.exports = DisplayLayer

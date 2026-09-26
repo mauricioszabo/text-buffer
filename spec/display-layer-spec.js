@@ -2519,6 +2519,84 @@ describe('DisplayLayer', () => {
     })
   })
 
+  describe('render planners', () => {
+    const {RenderPlanner} = require('../src/display-layer')
+    const opName = (op) => ['KEEP', 'INSERT', 'REPLACE', 'MOVE', 'REMOVE'][op]
+
+    function decodeOps (plan, screenLinesById) {
+      const ops = []
+      for (let i = 0; i < plan.ops.length; i += 4) {
+        const line = screenLinesById.get(plan.ops[i + 1])
+        const oldLine = screenLinesById.get(plan.ops[i + 3])
+        ops.push([opName(plan.ops[i]), line ? line.lineText : null, plan.ops[i + 2], oldLine ? oldLine.lineText : null])
+      }
+      return ops
+    }
+
+    function build (planner, start, end, screenLinesById) {
+      const plan = planner.buildRenderPlan(start, end)
+      for (const line of plan.screenLines) screenLinesById.set(line.id, line)
+      return plan
+    }
+
+    it('reports kept, inserted, moved and removed lines as the viewport scrolls', () => {
+      const buffer = new TextBuffer({text: 'a\nb\nc\nd\ne'})
+      const displayLayer = buffer.addDisplayLayer({})
+      const planner = displayLayer.createRenderPlanner()
+      const lines = new Map()
+
+      let plan = build(planner, 0, 3, lines)
+      expect(plan.screenLines.map((l) => l.lineText)).toEqual(['a', 'b', 'c'])
+      expect(decodeOps(plan, lines)).toEqual([
+        ['INSERT', 'a', 0, null], ['INSERT', 'b', 1, null], ['INSERT', 'c', 2, null]
+      ])
+      expect(plan.htmlByScreenLineId.get(plan.screenLines[0].id)).toBe('<span>a</span>')
+
+      plan = build(planner, 1, 4, lines)
+      expect(decodeOps(plan, lines)).toEqual([
+        ['KEEP', 'b', 1, null], ['KEEP', 'c', 2, null], ['INSERT', 'd', 3, null], ['REMOVE', 'a', 0, null]
+      ])
+      expect(plan.htmlByScreenLineId.size).toBe(1)
+
+      buffer.insert([0, 0], 'x\n')
+      plan = build(planner, 1, 4, lines)
+      expect(decodeOps(plan, lines)).toEqual([
+        ['INSERT', 'a', 1, null], ['MOVE', 'b', 2, null], ['MOVE', 'c', 3, null], ['REMOVE', 'd', 3, null]
+      ])
+    })
+
+    it('replaces edited lines in place', () => {
+      const buffer = new TextBuffer({text: 'a\nb\nc'})
+      const displayLayer = buffer.addDisplayLayer({})
+      const planner = displayLayer.createRenderPlanner()
+      const lines = new Map()
+      build(planner, 0, 3, lines)
+
+      buffer.setTextInRange([[1, 0], [1, 1]], 'x < y & z')
+      const plan = build(planner, 0, 3, lines)
+      expect(decodeOps(plan, lines)).toEqual([
+        ['KEEP', 'a', 0, null], ['REPLACE', 'x < y & z', 1, 'b'], ['KEEP', 'c', 2, null]
+      ])
+      expect(plan.htmlByScreenLineId.get(plan.screenLines[1].id)).toBe('<span>x &lt; y &amp; z</span>')
+    })
+
+    it('renders scopes, built-in decorations, empty lines and folds as HTML', () => {
+      const buffer = new TextBuffer({text: 'abc\n\ndef\nghi'})
+      const displayLayer = buffer.addDisplayLayer({invisibles: {eol: '¬'}, foldCharacter: '⋯'})
+      buffer.setLanguageMode(new TestLanguageMode([['keyword', [[0, 0], [0, 2]]]]))
+      displayLayer.foldBufferRange([[2, 1], [3, 3]])
+      const planner = displayLayer.createRenderPlanner()
+      const plan = planner.buildRenderPlan(0, 3)
+      const html = plan.screenLines.map((line) => plan.htmlByScreenLineId.get(line.id))
+      expect(html).toEqual([
+        '<span><span class="keyword">ab</span>c<span class="invisible-character eol">¬</span></span>',
+        '<span><span class="invisible-character eol">¬</span></span>',
+        '<span>d<span class="fold-marker">⋯</span></span>\uFEFF'
+      ])
+      expect(RenderPlanner.REMOVE).toBe(4)
+    })
+  })
+
   describe('.getScreenLines(startRow, endRow)', () => {
     it('returns an empty array when the given start row is greater than the screen line count', () => {
       const buffer = new TextBuffer({
