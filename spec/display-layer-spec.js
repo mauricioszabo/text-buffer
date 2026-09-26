@@ -2553,6 +2553,71 @@ describe('DisplayLayer', () => {
     })
   })
 
+  describe('parallel indexing', () => {
+    const {DisplayLayer: NativeDisplayLayer} = require('@pulsar-edit/superstring')
+    afterEach(() => NativeDisplayLayer.setParallelIndexingThreshold(2000))
+
+    it('lays out large ranges on worker threads exactly like the sequential path', () => {
+      const words = ['lorem', 'ipsum', '\t', 'dolor', '中文字', 'ｶﾀｶﾅ', '한국어', 'é', '😀', 'sit', '-amet', '/path/', '  ', '\r']
+      for (let seed = 1; seed <= 3; seed++) {
+        const random = new Random(seed)
+        const lines = []
+        for (let row = 0; row < 6000; row++) {
+          let line = random(4) === 0 ? '\t' : '  '.repeat(random(3))
+          const length = random(5) === 0 ? random.intBetween(100, 600) : random(60)
+          while (line.length < length) line += words[random(words.length)] + (random(3) ? ' ' : '')
+          lines.push(line)
+        }
+        const buffer = new TextBuffer({text: lines.join(random(2) ? '\n' : '\r\n')})
+        const params = {
+          softWrapColumn: random(2) ? random.intBetween(10, 80) : null,
+          softWrapHangingIndent: random(3),
+          tabLength: random.intBetween(2, 5),
+          characterWidthRatios: {doubleWidth: 2, halfWidth: 0.5, korean: 1.5},
+          wrapBoundaryMode: 'cjk'
+        }
+        const foldRanges = []
+        for (let i = 0; i < 30; i++) {
+          const startRow = random(5990)
+          foldRanges.push([[startRow, random(buffer.lineLengthForRow(startRow) + 1)], [startRow + random(5), 0]])
+        }
+
+        const build = (threshold, ranges = foldRanges) => {
+          NativeDisplayLayer.setParallelIndexingThreshold(threshold)
+          const displayLayer = buffer.addDisplayLayer(params)
+          for (const range of ranges) displayLayer.foldBufferRange(range)
+          displayLayer.getScreenLineCount()
+          return displayLayer
+        }
+        const sequential = build(Infinity)
+        const parallel = build(1)
+
+        const count = sequential.getScreenLineCount()
+        expect(parallel.getScreenLineCount()).toBe(count, `Seed ${seed}`)
+        expect(parallel.getRightmostScreenPosition().column).toBe(sequential.getRightmostScreenPosition().column)
+        expect(parallel.getScreenLines(0, count).map((l) => l.lineText)).toEqual(sequential.getScreenLines(0, count).map((l) => l.lineText))
+        for (let row = 0; row < count; row += 7) {
+          expect(parallel.lineLengthForScreenRow(row)).toBe(sequential.lineLengthForScreenRow(row))
+        }
+        for (let i = 0; i < 500; i++) {
+          const bufferRow = random(buffer.getLineCount())
+          const bufferPosition = Point(bufferRow, random(buffer.lineLengthForRow(bufferRow) + 1))
+          expect(parallel.translateBufferPosition(bufferPosition)).toEqual(sequential.translateBufferPosition(bufferPosition))
+          const screenPosition = Point(random(count), random(40))
+          expect(parallel.translateScreenPosition(screenPosition)).toEqual(sequential.translateScreenPosition(screenPosition))
+        }
+
+        // Large insertions go through the parallel path too.
+        buffer.insert([random(6000), 0], lines.slice(0, 3000).join('\n') + '\n')
+        // Folds moved with the insertion; fold the same (current) ranges.
+        const fresh = build(Infinity, parallel.foldsMarkerLayer.getMarkers().map((marker) => marker.getRange()))
+        const newCount = fresh.getScreenLineCount()
+        expect(parallel.getScreenLineCount()).toBe(newCount)
+        expect(parallel.getScreenLines(0, newCount).map((l) => l.lineText)).toEqual(fresh.getScreenLines(0, newCount).map((l) => l.lineText))
+      }
+    })
+  })
+
   describe('.doBackgroundWork(deadline)', () => {
     const fakeDeadline = function (timeRemaining) {
       return {
