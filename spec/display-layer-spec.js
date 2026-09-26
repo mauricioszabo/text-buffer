@@ -2004,6 +2004,60 @@ describe('DisplayLayer', () => {
       }])
     })
 
+    it('handles iterators that report several boundaries at the same position with a reused point', () => {
+      const buffer = new TextBuffer({text: 'ab cd\nef'})
+      const displayLayer = buffer.addDisplayLayer({})
+
+      // Like tree-sitter's iterator: consecutive boundaries may share a
+      // position and getPosition() returns the same mutable point.
+      const boundaries = [
+        {row: 0, column: 0, close: [], open: [301]},
+        {row: 0, column: 2, close: [301], open: []},
+        {row: 0, column: 2, close: [], open: [303]},
+        {row: 0, column: 3, close: [303], open: [305]},
+        {row: 0, column: 5, close: [305], open: []},
+        {row: 1, column: 0, close: [], open: [301]},
+        {row: 1, column: 2, close: [301], open: []}
+      ]
+      const classNames = {301: 'a', 303: 'b', 305: 'c'}
+      buffer.setLanguageMode({
+        buildHighlightIterator () {
+          const point = {row: 0, column: 0}
+          let index = 0
+          const sync = () => {
+            const boundary = boundaries[index]
+            point.row = boundary ? boundary.row : Infinity
+            point.column = boundary ? boundary.column : Infinity
+          }
+          return {
+            seek (position) {
+              index = boundaries.findIndex((b) => b.row > position.row || (b.row === position.row && b.column >= position.column))
+              if (index === -1) index = boundaries.length
+              sync()
+              return []
+            },
+            moveToSuccessor () { index++; sync() },
+            getPosition () { return point },
+            getCloseScopeIds () { return boundaries[index].close },
+            getOpenScopeIds () { return boundaries[index].open }
+          }
+        },
+        classNameForScopeId (id) { return classNames[id] },
+        onDidChangeHighlighting () { return {dispose () {}} },
+        bufferDidChange () {},
+        bufferDidFinishTransaction () {}
+      })
+
+      expectTokenBoundaries(displayLayer, [
+        {text: 'ab', close: [], open: ['a']},
+        {text: ' ', close: ['a'], open: ['b']},
+        {text: 'cd', close: ['b'], open: ['c']},
+        {text: '', close: ['c'], open: []},
+        {text: 'ef', close: [], open: ['a']},
+        {text: '', close: ['a'], open: []}
+      ])
+    })
+
     it('gracefully handles the text decoration iterator reporting decoration boundaries beyond the end of a line', () => {
       const buffer = new TextBuffer({
         text: 'abc\ndef'

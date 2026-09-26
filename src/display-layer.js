@@ -473,6 +473,7 @@ class DisplayLayer {
         let lineLengthRow = -1
         let lineLength = 0
         let stuckRow = -1
+        let repeatedPositionCount = 0
         let position = iterator.getPosition()
         while (position.row <= segmentEndRow) {
           if (position.row !== lineLengthRow) {
@@ -490,11 +491,18 @@ class DisplayLayer {
           data.push(openScopeIds.length)
           for (let j = 0; j < openScopeIds.length; j++) data.push(openScopeIds[j])
           boundaryCount++
+          // Iterators may report several boundaries at the same position (and
+          // may reuse one mutable point), so compare copied coordinates, and
+          // only bail out if an iterator never advances.
+          const previousRow = position.row
+          const previousColumn = position.column
           iterator.moveToSuccessor()
-          const nextPosition = iterator.getPosition()
-          // Guard against iterators that fail to advance.
-          if (nextPosition.row === position.row && nextPosition.column === position.column) break
-          position = nextPosition
+          position = iterator.getPosition()
+          if (position.row === previousRow && position.column === previousColumn) {
+            if (++repeatedPositionCount > 10000) break
+          } else {
+            repeatedPositionCount = 0
+          }
         }
         data[nextPositionIndex] = encodeCoordinate(position.row)
         data[nextPositionIndex + 1] = encodeCoordinate(position.column)
