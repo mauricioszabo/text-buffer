@@ -1,27 +1,38 @@
-const {Patch} = require('@pulsar-edit/superstring')
+const {Patch, DisplayLayer: NativeDisplayLayer} = require('@pulsar-edit/superstring')
 const {Emitter} = require('event-kit')
 const Point = require('./point')
 const Range = require('./range')
 const DisplayMarkerLayer = require('./display-marker-layer')
-const {traverse, traversal, compare, max, isEqual} = require('./point-helpers')
-const isCharacterPair = require('./is-character-pair')
-const ScreenLineBuilder = require('./screen-line-builder')
+const {max} = require('./point-helpers')
 const {spliceArray} = require('./helpers')
 const {MAX_BUILT_IN_SCOPE_ID} = require('./constants')
 
+// Built-in decoration flags (must match superstring's display-layer.cc).
+const HARD_TAB = 1 << 0
+const LEADING_WHITESPACE = 1 << 2
+const TRAILING_WHITESPACE = 1 << 3
+const INVISIBLE_CHARACTER = 1 << 4
+const INDENT_GUIDE = 1 << 5
+const LINE_ENDING = 1 << 6
+const FOLD = 1 << 7
+
+const CLIP_DIRECTION_CODES = {closest: 0, backward: 1, forward: 2}
+
+// The spatial index, soft wrapping, folds, coordinate translation and
+// screen-line building all live in superstring's native `DisplayLayer`. This
+// class owns the public API, events, fold markers and the JS screen-line
+// objects handed to the editor.
 class DisplayLayer {
   constructor (id, buffer, params = {}) {
     this.id = id
     this.buffer = buffer
     this.emitter = new Emitter()
-    this.screenLineBuilder = new ScreenLineBuilder(this)
     this.cachedScreenLines = []
-    this.builtInScopeIdsByFlags = new Map()
     this.builtInClassNamesByScopeId = new Map()
-    this.nextBuiltInScopeId = 1
     this.displayMarkerLayersById = new Map()
     this.destroyed = false
     this.changesSinceLastEvent = new Patch()
+    this.scratch = new Float64Array(4)
 
     this.invisibles = params.invisibles != null ? params.invisibles : {}
     this.tabLength = params.tabLength != null ? params.tabLength : 4
@@ -30,6 +41,8 @@ class DisplayLayer {
     this.showIndentGuides = params.showIndentGuides != null ? params.showIndentGuides : false
     this.ratioForCharacter = params.ratioForCharacter != null ? params.ratioForCharacter : unitRatio
     this.isWrapBoundary = params.isWrapBoundary != null ? params.isWrapBoundary : isWordStart
+    this.characterWidthRatios = params.characterWidthRatios != null ? params.characterWidthRatios : null
+    this.wrapBoundaryMode = params.wrapBoundaryMode != null ? params.wrapBoundaryMode : null
     this.foldCharacter = params.foldCharacter != null ? params.foldCharacter : '⋯'
     this.atomicSoftTabs = params.atomicSoftTabs != null ? params.atomicSoftTabs : true
 
@@ -46,26 +59,13 @@ class DisplayLayer {
     })
     this.foldIdCounter = params.foldIdCounter || 1
 
-    if (params.spatialIndex) {
-      this.spatialIndex = params.spatialIndex
-      this.tabCounts = params.tabCounts
-      this.screenLineLengths = params.screenLineLengths
-      this.rightmostScreenPosition = params.rightmostScreenPosition
-      this.indexedBufferRowCount = params.indexedBufferRowCount
-    } else {
-      this.spatialIndex = new Patch({
-        // The `mergeAdjacentHunks` option in `superstring` was renamed to
-        // `mergeAdjacentChanges` at a certain point. In order to remain
-        // compatible with the broadest possible range of `superstring`
-        // dependencies, we pass both options here.
-        mergeAdjacentHunks: false,
-        mergeAdjacentChanges: false
-      })
-      this.tabCounts = []
-      this.screenLineLengths = []
-      this.rightmostScreenPosition = Point(0, 0)
-      this.indexedBufferRowCount = 0
-    }
+    this.nativeDisplayLayer = new NativeDisplayLayer(
+      buffer.buffer,
+      this.foldsMarkerLayer,
+      this.getNativeParams(),
+      this.scratch,
+      params.nativeSource
+    )
 
     this.bufferDidChangeLanguageMode()
   }
@@ -83,6 +83,27 @@ class DisplayLayer {
     }
   }
 
+  getNativeParams () {
+    return {
+      tabLength: this.tabLength,
+      softWrapColumn: this.softWrapColumn,
+      softWrapHangingIndent: this.softWrapHangingIndent,
+      showIndentGuides: this.showIndentGuides,
+      atomicSoftTabs: this.atomicSoftTabs,
+      invisibleSpace: this.invisibles.space,
+      invisibleTab: this.invisibles.tab,
+      eolInvisibleLf: this.eolInvisibles['\n'],
+      eolInvisibleCrlf: this.eolInvisibles['\r\n'],
+      foldCharacter: this.foldCharacter,
+      // Measured width ratios and a named wrap-boundary rule are evaluated
+      // natively; arbitrary JS functions are supported, but slower.
+      characterWidthRatios: this.characterWidthRatios || undefined,
+      ratioForCharacter: this.ratioForCharacter === unitRatio ? undefined : this.ratioForCharacter,
+      wrapBoundaryMode: this.wrapBoundaryMode || (this.isWrapBoundary === isWordStart ? 'default' : undefined),
+      isWrapBoundary: this.isWrapBoundary === isWordStart ? undefined : this.isWrapBoundary
+    }
+  }
+
   reset (params) {
     if (!this.isDestroyed() && this.setParams(params)) {
       this.clearSpatialIndex()
@@ -96,11 +117,7 @@ class DisplayLayer {
     const copy = new DisplayLayer(copyId, this.buffer, {
       foldsMarkerLayer: this.foldsMarkerLayer.copy(),
       foldIdCounter: this.foldIdCounter,
-      spatialIndex: this.spatialIndex.copy(),
-      tabCounts: this.tabCounts.slice(),
-      screenLineLengths: this.screenLineLengths.slice(),
-      rightmostScreenPosition: this.rightmostScreenPosition.copy(),
-      indexedBufferRowCount: this.indexedBufferRowCount,
+      nativeSource: this.nativeDisplayLayer,
       invisibles: this.invisibles,
       tabLength: this.tabLength,
       softWrapColumn: this.softWrapColumn,
@@ -108,6 +125,8 @@ class DisplayLayer {
       showIndentGuides: this.showIndentGuides,
       ratioForCharacter: this.ratioForCharacter,
       isWrapBoundary: this.isWrapBoundary,
+      characterWidthRatios: this.characterWidthRatios,
+      wrapBoundaryMode: this.wrapBoundaryMode,
       foldCharacter: this.foldCharacter,
       atomicSoftTabs: this.atomicSoftTabs
     })
@@ -130,31 +149,29 @@ class DisplayLayer {
   }
 
   clearSpatialIndex () {
-    this.indexedBufferRowCount = 0
-    this.spatialIndex.spliceOld(Point.ZERO, Point.INFINITY, Point.INFINITY)
+    this.nativeDisplayLayer.clearSpatialIndex()
     this.cachedScreenLines.length = 0
-    this.screenLineLengths.length = 0
-    this.tabCounts.length = 0
-    this.rightmostScreenPosition = Point(0, 0)
+  }
+
+  get indexedBufferRowCount () {
+    return this.nativeDisplayLayer.getIndexedBufferRowCount()
   }
 
   doBackgroundWork (deadline) {
-    this.populateSpatialIndexIfNeeded(this.buffer.getLineCount(), Infinity, deadline)
-    return this.indexedBufferRowCount < this.buffer.getLineCount()
+    return this.nativeDisplayLayer.doBackgroundWork(deadline)
   }
 
   bufferDidChangeLanguageMode () {
     this.cachedScreenLines.length = 0
+    this.nativeDisplayLayer.clearScreenLineCache()
     if (this.languageModeDisposable) this.languageModeDisposable.dispose()
     this.languageModeDisposable = this.buffer.languageMode.onDidChangeHighlighting((bufferRange) => {
       bufferRange = Range.fromObject(bufferRange)
-      this.populateSpatialIndexIfNeeded(bufferRange.end.row + 1, Infinity)
-      const startBufferRow = this.findBoundaryPrecedingBufferRow(bufferRange.start.row)
-      const endBufferRow = this.findBoundaryFollowingBufferRow(bufferRange.end.row + 1)
-      const startRow = this.translateBufferPositionWithSpatialIndex(Point(startBufferRow, 0), 'backward').row
-      const endRow = this.translateBufferPositionWithSpatialIndex(Point(endBufferRow, 0), 'backward').row
-      const extent = Point(endRow - startRow, 0)
-      spliceArray(this.cachedScreenLines, startRow, extent.row, new Array(extent.row))
+      this.nativeDisplayLayer.invalidateHighlighting(bufferRange.start.row, bufferRange.end.row)
+      const startRow = this.scratch[0]
+      const rowCount = this.scratch[1]
+      spliceArray(this.cachedScreenLines, startRow, rowCount, new Array(rowCount))
+      const extent = Point(rowCount, 0)
       this.didChange({
         start: Point(startRow, 0),
         oldExtent: extent,
@@ -286,51 +303,14 @@ class DisplayLayer {
   }
 
   translateBufferPosition (bufferPosition, options) {
-    bufferPosition = this.buffer.clipPosition(bufferPosition)
-    this.populateSpatialIndexIfNeeded(bufferPosition.row + 1, Infinity)
-
-    const clipDirection = (options && options.clipDirection) || 'closest'
-    const columnDelta = this.getClipColumnDelta(bufferPosition, clipDirection)
-    if (columnDelta !== 0) {
-      bufferPosition = Point(bufferPosition.row, bufferPosition.column + columnDelta)
-    }
-
-    let screenPosition = this.translateBufferPositionWithSpatialIndex(bufferPosition, clipDirection)
-    const tabCount = this.tabCounts[screenPosition.row]
-    if (tabCount > 0) {
-      screenPosition = this.expandHardTabs(screenPosition, bufferPosition, tabCount)
-    }
-
-    return Point.fromObject(screenPosition)
-  }
-
-  translateBufferPositionWithSpatialIndex (bufferPosition, clipDirection) {
-    let hunk = this.spatialIndex.changeForOldPosition(bufferPosition)
-    if (hunk) {
-      if (compare(bufferPosition, hunk.oldEnd) < 0) {
-        if (compare(hunk.oldStart, bufferPosition) === 0) {
-          return hunk.newStart
-        } else { // hunk is a fold
-          if (clipDirection === 'backward') {
-            return hunk.newStart
-          } else if (clipDirection === 'forward') {
-            return hunk.newEnd
-          } else {
-            const distanceFromFoldStart = traversal(bufferPosition, hunk.oldStart)
-            const distanceToFoldEnd = traversal(hunk.oldEnd, bufferPosition)
-            if (compare(distanceFromFoldStart, distanceToFoldEnd) <= 0) {
-              return hunk.newStart
-            } else {
-              return hunk.newEnd
-            }
-          }
-        }
-      } else {
-        return traverse(hunk.newEnd, traversal(bufferPosition, hunk.oldEnd))
-      }
-    } else {
-      return bufferPosition
-    }
+    bufferPosition = Point.fromObject(bufferPosition)
+    Point.assertValid(bufferPosition)
+    this.nativeDisplayLayer.translateBufferPosition(
+      bufferPosition.row,
+      bufferPosition.column,
+      clipDirectionCode(options)
+    )
+    return Point(this.scratch[0], this.scratch[1])
   }
 
   translateBufferRange (bufferRange, options) {
@@ -344,51 +324,21 @@ class DisplayLayer {
   translateScreenPosition (screenPosition, options) {
     screenPosition = Point.fromObject(screenPosition)
     Point.assertValid(screenPosition)
-    const clipDirection = (options && options.clipDirection) || 'closest'
-    const skipSoftWrapIndentation = options && options.skipSoftWrapIndentation
-    this.populateSpatialIndexIfNeeded(this.buffer.getLineCount(), screenPosition.row + 1)
-    screenPosition = this.constrainScreenPosition(screenPosition, clipDirection)
-    const tabCount = this.tabCounts[screenPosition.row]
-    if (tabCount > 0) {
-      screenPosition = this.collapseHardTabs(screenPosition, tabCount, clipDirection)
-    }
-    const bufferPosition = this.translateScreenPositionWithSpatialIndex(screenPosition, clipDirection, skipSoftWrapIndentation)
+    this.nativeDisplayLayer.translateScreenPosition(
+      screenPosition.row,
+      screenPosition.column,
+      clipDirectionCode(options),
+      Boolean(options && options.skipSoftWrapIndentation)
+    )
+    const bufferPosition = Point(this.scratch[0], this.scratch[1])
 
-    if (global.atom && bufferPosition.row >= this.buffer.getLineCount()) {
+    if (this.scratch[2] && global.atom) {
       global.atom.assert(false, 'Invalid translated buffer row', {
         bufferPosition, bufferLineCount: this.buffer.getLineCount()
       })
-      return this.buffer.getEndPosition()
     }
 
-    const columnDelta = this.getClipColumnDelta(bufferPosition, clipDirection)
-    if (columnDelta !== 0) {
-      return Point(bufferPosition.row, bufferPosition.column + columnDelta)
-    } else {
-      return Point.fromObject(bufferPosition)
-    }
-  }
-
-  translateScreenPositionWithSpatialIndex (screenPosition, clipDirection, skipSoftWrapIndentation) {
-    let hunk = this.spatialIndex.changeForNewPosition(screenPosition)
-    if (hunk) {
-      if (compare(screenPosition, hunk.newEnd) < 0) {
-        if (this.isSoftWrapHunk(hunk)) {
-          if ((clipDirection === 'backward' && !skipSoftWrapIndentation) ||
-              (clipDirection === 'closest' && isEqual(hunk.newStart, screenPosition))) {
-            return this.translateScreenPositionWithSpatialIndex(traverse(hunk.newStart, Point(0, -1)), clipDirection, skipSoftWrapIndentation)
-          } else {
-            return hunk.oldStart
-          }
-        } else { // Hunk is a fold. Since folds are 1 character on screen, we're at the start.
-          return hunk.oldStart
-        }
-      } else {
-        return traverse(hunk.oldEnd, traversal(screenPosition, hunk.newEnd))
-      }
-    } else {
-      return screenPosition
-    }
+    return bufferPosition
   }
 
   translateScreenRange (screenRange, options) {
@@ -406,233 +356,34 @@ class DisplayLayer {
     )
   }
 
-  constrainScreenPosition (screenPosition, clipDirection) {
-    let {row, column} = screenPosition
-
-    if (row < 0) {
-      return new Point(0, 0)
-    }
-
-    const maxRow = this.screenLineLengths.length - 1
-    if (row > maxRow) {
-      return new Point(maxRow, this.screenLineLengths[maxRow])
-    }
-
-    if (column < 0) {
-      return new Point(row, 0)
-    }
-
-    const maxColumn = this.screenLineLengths[row]
-    if (column > maxColumn) {
-      if (clipDirection === 'forward' && row < maxRow) {
-        return new Point(row + 1, 0)
-      } else {
-        return new Point(row, maxColumn)
-      }
-    }
-
-    return screenPosition
-  }
-
-  expandHardTabs (targetScreenPosition, targetBufferPosition, tabCount) {
-    const screenRowStart = Point(targetScreenPosition.row, 0)
-    const hunks = this.spatialIndex.getChangesInNewRange(screenRowStart, targetScreenPosition)
-    let hunkIndex = 0
-    let unexpandedScreenColumn = 0
-    let expandedScreenColumn = 0
-    let {row: bufferRow, column: bufferColumn} = this.translateScreenPositionWithSpatialIndex(screenRowStart)
-    let bufferLine = this.buffer.lineForRow(bufferRow)
-
-    while (tabCount > 0) {
-      if (unexpandedScreenColumn === targetScreenPosition.column) {
-        break
-      }
-
-      let nextHunk = hunks[hunkIndex]
-      if (nextHunk && nextHunk.oldStart.row === bufferRow && nextHunk.oldStart.column === bufferColumn) {
-        if (this.isSoftWrapHunk(nextHunk)) {
-          if (hunkIndex !== 0) throw new Error('Unexpected soft wrap hunk')
-          unexpandedScreenColumn = hunks[0].newEnd.column
-          expandedScreenColumn = unexpandedScreenColumn
-        } else {
-          ({row: bufferRow, column: bufferColumn} = nextHunk.oldEnd)
-          bufferLine = this.buffer.lineForRow(bufferRow)
-          unexpandedScreenColumn++
-          expandedScreenColumn++
-        }
-
-        hunkIndex++
-        continue
-      }
-
-      if (bufferLine[bufferColumn] === '\t') {
-        expandedScreenColumn += (this.tabLength - (expandedScreenColumn % this.tabLength))
-        tabCount--
-      } else {
-        expandedScreenColumn++
-      }
-      unexpandedScreenColumn++
-      bufferColumn++
-    }
-
-    expandedScreenColumn += targetScreenPosition.column - unexpandedScreenColumn
-    if (expandedScreenColumn === targetScreenPosition.column) {
-      return targetScreenPosition
-    } else {
-      return Point(targetScreenPosition.row, expandedScreenColumn)
-    }
-  }
-
-  collapseHardTabs (targetScreenPosition, tabCount, clipDirection) {
-    const screenRowStart = Point(targetScreenPosition.row, 0)
-    const screenRowEnd = Point(targetScreenPosition.row, this.screenLineLengths[targetScreenPosition.row])
-
-    const hunks = this.spatialIndex.getChangesInNewRange(screenRowStart, screenRowEnd)
-    let hunkIndex = 0
-    let unexpandedScreenColumn = 0
-    let expandedScreenColumn = 0
-    let {row: bufferRow, column: bufferColumn} = this.translateScreenPositionWithSpatialIndex(screenRowStart)
-    let bufferLine = this.buffer.lineForRow(bufferRow)
-
-    while (tabCount > 0) {
-      if (expandedScreenColumn === targetScreenPosition.column) {
-        break
-      }
-
-      let nextHunk = hunks[hunkIndex]
-      if (nextHunk && nextHunk.oldStart.row === bufferRow && nextHunk.oldStart.column === bufferColumn) {
-        if (this.isSoftWrapHunk(nextHunk)) {
-          if (hunkIndex !== 0) throw new Error('Unexpected soft wrap hunk')
-          unexpandedScreenColumn = Math.min(targetScreenPosition.column, nextHunk.newEnd.column)
-          expandedScreenColumn = unexpandedScreenColumn
-        } else {
-          ({row: bufferRow, column: bufferColumn} = nextHunk.oldEnd)
-          bufferLine = this.buffer.lineForRow(bufferRow)
-          unexpandedScreenColumn++
-          expandedScreenColumn++
-        }
-        hunkIndex++
-        continue
-      }
-
-      if (bufferLine[bufferColumn] === '\t') {
-        const nextTabStopColumn = expandedScreenColumn + this.tabLength - (expandedScreenColumn % this.tabLength)
-        if (nextTabStopColumn > targetScreenPosition.column) {
-          if (clipDirection === 'backward') {
-            return Point(targetScreenPosition.row, unexpandedScreenColumn)
-          } else if (clipDirection === 'forward') {
-            return Point(targetScreenPosition.row, unexpandedScreenColumn + 1)
-          } else {
-            if (targetScreenPosition.column > Math.ceil((nextTabStopColumn + expandedScreenColumn) / 2)) {
-              return Point(targetScreenPosition.row, unexpandedScreenColumn + 1)
-            } else {
-              return Point(targetScreenPosition.row, unexpandedScreenColumn)
-            }
-          }
-        }
-        expandedScreenColumn = nextTabStopColumn
-        tabCount--
-      } else {
-        expandedScreenColumn++
-      }
-      unexpandedScreenColumn++
-      bufferColumn++
-    }
-
-    unexpandedScreenColumn += targetScreenPosition.column - expandedScreenColumn
-    if (unexpandedScreenColumn === targetScreenPosition.column) {
-      return targetScreenPosition
-    } else {
-      return Point(targetScreenPosition.row, unexpandedScreenColumn)
-    }
-  }
-
-  getClipColumnDelta (bufferPosition, clipDirection) {
-    var {row, column} = bufferPosition
-
-    // Treat paired unicode characters as atomic...
-    var character = this.buffer.getCharacterAtPosition(bufferPosition)
-    var previousCharacter = this.buffer.getCharacterAtPosition([row, column - 1])
-    if (previousCharacter && character && isCharacterPair(previousCharacter, character)) {
-      if (clipDirection === 'closest' || clipDirection === 'backward') {
-        return -1
-      } else {
-        return 1
-      }
-    }
-
-    // Clip atomic soft tabs...
-
-    if (!this.atomicSoftTabs) return 0
-
-    if (column * this.ratioForCharacter(' ') > this.softWrapColumn) {
-      return 0
-    }
-
-    for (let position = {row, column}; position.column >= 0; position.column--) {
-      if (this.buffer.getCharacterAtPosition(position) !== ' ') return 0
-    }
-
-    var previousTabStop = column - (column % this.tabLength)
-    if (column === previousTabStop) return 0
-    var nextTabStop = previousTabStop + this.tabLength
-
-    // If there is a non-whitespace character before the next tab stop,
-    // don't this whitespace as a soft tab
-    for (let position = {row, column}; position.column < nextTabStop; position.column++) {
-      if (this.buffer.getCharacterAtPosition(position) !== ' ') return 0
-    }
-
-    var clippedColumn
-    if (clipDirection === 'closest') {
-      if (column - previousTabStop > this.tabLength / 2) {
-        clippedColumn = nextTabStop
-      } else {
-        clippedColumn = previousTabStop
-      }
-    } else if (clipDirection === 'backward') {
-      clippedColumn = previousTabStop
-    } else if (clipDirection === 'forward') {
-      clippedColumn = nextTabStop
-    }
-
-    return clippedColumn - column
-  }
-
   getText (startRow, endRow) {
     return this.getScreenLines(startRow, endRow).map((line) => line.lineText).join('\n')
   }
 
   lineLengthForScreenRow (screenRow) {
-    this.populateSpatialIndexIfNeeded(this.buffer.getLineCount(), screenRow + 1)
-    return this.screenLineLengths[screenRow]
+    return this.nativeDisplayLayer.lineLengthForScreenRow(screenRow)
   }
 
   getLastScreenRow () {
-    this.populateSpatialIndexIfNeeded(this.buffer.getLineCount(), Infinity)
-    return this.screenLineLengths.length - 1
+    return this.getScreenLineCount() - 1
   }
 
   getScreenLineCount () {
-    this.populateSpatialIndexIfNeeded(this.buffer.getLineCount(), Infinity)
-    return this.screenLineLengths.length
+    return this.nativeDisplayLayer.getScreenLineCount()
   }
 
   getApproximateScreenLineCount () {
-    if (this.indexedBufferRowCount > 0) {
-      return Math.floor(this.buffer.getLineCount() * this.screenLineLengths.length / this.indexedBufferRowCount)
-    } else {
-      return this.buffer.getLineCount()
-    }
+    return this.nativeDisplayLayer.getApproximateScreenLineCount()
   }
 
   getRightmostScreenPosition () {
-    this.populateSpatialIndexIfNeeded(this.buffer.getLineCount(), Infinity)
-    return this.rightmostScreenPosition
+    this.nativeDisplayLayer.getRightmostScreenPosition()
+    return Point(this.scratch[0], this.scratch[1])
   }
 
   getApproximateRightmostScreenPosition () {
-    return this.rightmostScreenPosition
+    this.nativeDisplayLayer.getApproximateRightmostScreenPosition()
+    return Point(this.scratch[0], this.scratch[1])
   }
 
   getScreenLine (screenRow) {
@@ -640,106 +391,132 @@ class DisplayLayer {
   }
 
   getScreenLines (screenStartRow = 0, screenEndRow = this.getScreenLineCount()) {
-    return this.screenLineBuilder.buildScreenLines(screenStartRow, screenEndRow)
+    let result
+    // Highlighting can be invalidated while we collect it (a language mode
+    // may tokenize lazily); retry, and finally accept what we have.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const segments = this.nativeDisplayLayer.prepareScreenLines(screenStartRow, screenEndRow)
+      const highlightBatch = segments ? this.collectHighlightBatch(segments) : null
+      result = this.nativeDisplayLayer.buildScreenLines(
+        screenStartRow,
+        screenEndRow,
+        highlightBatch,
+        this.getKnownScreenLineIds(screenStartRow, screenEndRow),
+        attempt < 2
+      )
+      if (result) break
+    }
+
+    const [ids, dataIndexes, texts, tagOffsets, tags, softWrapIndents, newBuiltInScopes] = result
+    if (newBuiltInScopes) this.registerBuiltInScopes(newBuiltInScopes)
+
+    const screenLines = new Array(ids.length)
+    let dataIndex = 0
+    for (let i = 0; i < ids.length; i++) {
+      let screenLine
+      if (dataIndex < dataIndexes.length && dataIndexes[dataIndex] === i) {
+        screenLine = {
+          id: ids[i],
+          lineText: texts[dataIndex],
+          tags: Array.from(tags.subarray(tagOffsets[dataIndex], tagOffsets[dataIndex + 1])),
+          softWrapIndent: softWrapIndents[dataIndex]
+        }
+        this.cachedScreenLines[screenStartRow + i] = screenLine
+        dataIndex++
+      } else {
+        screenLine = this.cachedScreenLines[screenStartRow + i]
+      }
+      screenLines[i] = screenLine
+    }
+    return screenLines
+  }
+
+  // Ids of the screen lines we already hold objects for, so the native side
+  // only sends the contents of new lines.
+  getKnownScreenLineIds (startRow, endRow) {
+    const count = Math.max(0, Math.min(endRow, this.cachedScreenLines.length) - startRow)
+    const ids = new Uint32Array(count)
+    for (let i = 0; i < count; i++) {
+      const screenLine = this.cachedScreenLines[startRow + i]
+      if (screenLine) ids[i] = screenLine.id
+    }
+    return ids
+  }
+
+  // Drives the language mode's highlight iterator over the segments the
+  // native builder needs, encoding the boundaries into one Int32Array (see
+  // `decode_highlight_batch` in superstring's display-layer-wrapper.cc).
+  //
+  // A boundary past the end of its line can never be reached by the
+  // builder; the iterator stays stuck on it and gets re-seeked at the start
+  // of the next row, so we record a "reseek" segment there.
+  collectHighlightBatch (segments) {
+    const endBufferRow = segments[0]
+    const iterator = this.buffer.languageMode.buildHighlightIterator()
+    const data = [0]
+    let segmentCount = 0
+    for (let i = 1; i < segments.length; i += 3) {
+      let startRow = segments[i]
+      let startColumn = segments[i + 1]
+      const segmentEndRow = segments[i + 2]
+      let isReseek = 0
+
+      while (true) {
+        segmentCount++
+        const containingScopeIds = iterator.seek(Point(startRow, startColumn), endBufferRow) || []
+        data.push(startRow, startColumn, isReseek, containingScopeIds.length)
+        for (let j = 0; j < containingScopeIds.length; j++) data.push(containingScopeIds[j])
+
+        const nextPositionIndex = data.length
+        data.push(-1, -1, 0)
+        let boundaryCount = 0
+        let lineLengthRow = -1
+        let lineLength = 0
+        let stuckRow = -1
+        let position = iterator.getPosition()
+        while (position.row <= segmentEndRow) {
+          if (position.row !== lineLengthRow) {
+            lineLengthRow = position.row
+            lineLength = this.buffer.lineLengthForRow(position.row)
+          }
+          if (position.column > lineLength) {
+            stuckRow = position.row
+            break
+          }
+          const closeScopeIds = iterator.getCloseScopeIds()
+          const openScopeIds = iterator.getOpenScopeIds()
+          data.push(position.row, position.column, closeScopeIds.length)
+          for (let j = 0; j < closeScopeIds.length; j++) data.push(closeScopeIds[j])
+          data.push(openScopeIds.length)
+          for (let j = 0; j < openScopeIds.length; j++) data.push(openScopeIds[j])
+          boundaryCount++
+          iterator.moveToSuccessor()
+          const nextPosition = iterator.getPosition()
+          // Guard against iterators that fail to advance.
+          if (nextPosition.row === position.row && nextPosition.column === position.column) break
+          position = nextPosition
+        }
+        data[nextPositionIndex] = encodeCoordinate(position.row)
+        data[nextPositionIndex + 1] = encodeCoordinate(position.column)
+        data[nextPositionIndex + 2] = boundaryCount
+
+        if (stuckRow === -1 || stuckRow + 1 > segmentEndRow) break
+        startRow = stuckRow + 1
+        startColumn = 0
+        isReseek = 1
+      }
+    }
+    data[0] = segmentCount
+    return new Int32Array(data)
   }
 
   bufferRowsForScreenRows (startRow, endRow) {
-    this.populateSpatialIndexIfNeeded(this.buffer.getLineCount(), endRow)
-
-    const startPosition = Point(startRow, 0)
-    const bufferRows = []
-    let lastScreenRow = startRow
-    let lastBufferRow = this.translateScreenPositionWithSpatialIndex(startPosition).row
-    const hunks = this.spatialIndex.getChangesInNewRange(startPosition, Point(endRow, 0))
-    for (let i = 0; i < hunks.length; i++) {
-      const hunk = hunks[i]
-      while (lastScreenRow <= hunk.newStart.row) {
-        bufferRows.push(lastBufferRow)
-        lastScreenRow++
-        lastBufferRow++
-      }
-
-      lastBufferRow = this.isSoftWrapHunk(hunk) ? hunk.oldEnd.row : hunk.oldEnd.row + 1
-    }
-
-    while (lastScreenRow < endRow) {
-      bufferRows.push(lastBufferRow)
-      lastScreenRow++
-      lastBufferRow++
-    }
-
-    return bufferRows
+    return Array.from(this.nativeDisplayLayer.bufferRowsForScreenRows(startRow, endRow))
   }
 
-  leadingWhitespaceLengthForSurroundingLines (startBufferRow) {
-    let length = 0
-    for (let bufferRow = startBufferRow - 1; bufferRow >= 0; bufferRow--) {
-      const line = this.buffer.lineForRow(bufferRow)
-      if (line.length > 0) {
-        length = this.leadingWhitespaceLengthForNonEmptyLine(line)
-        break
-      }
-    }
-
-    const lineCount = this.buffer.getLineCount()
-    for (let bufferRow = startBufferRow + 1; bufferRow < lineCount; bufferRow++) {
-      const line = this.buffer.lineForRow(bufferRow)
-      if (line.length > 0) {
-        length = Math.max(length, this.leadingWhitespaceLengthForNonEmptyLine(line))
-        break
-      }
-    }
-
-    return length
-  }
-
-  leadingWhitespaceLengthForNonEmptyLine (line) {
-    let length = 0
-    for (let i = 0; i < line.length; i++) {
-      const character = line[i]
-      if (character === ' ') {
-        length++
-      } else if (character === '\t') {
-        length += this.tabLength - (length % this.tabLength)
-      } else {
-        break
-      }
-    }
-    return length
-  }
-
-  findTrailingWhitespaceStartColumn (bufferRow) {
-    let position
-    for (position = {row: bufferRow, column: this.buffer.lineLengthForRow(bufferRow) - 1}; position.column >= 0; position.column--) {
-      const previousCharacter = this.buffer.getCharacterAtPosition(position)
-      if (previousCharacter !== ' ' && previousCharacter !== '\t') {
-        break
-      }
-    }
-    return position.column + 1
-  }
-
-  registerBuiltInScope (flags, className) {
-    if (this.nextBuiltInScopeId > MAX_BUILT_IN_SCOPE_ID) {
-      throw new Error('Built in scope ids exhausted')
-    }
-
-    let scopeId
-    if (className.length > 0) {
-      scopeId = this.nextBuiltInScopeId += 2
-      this.builtInClassNamesByScopeId.set(scopeId, className)
-    } else {
-      scopeId = 0
-    }
-    this.builtInScopeIdsByFlags.set(flags, scopeId)
-    return scopeId
-  }
-
-  getBuiltInScopeId (flags) {
-    if (this.builtInScopeIdsByFlags.has(flags)) {
-      return this.builtInScopeIdsByFlags.get(flags)
-    } else {
-      return -1
+  registerBuiltInScopes (scopes) {
+    for (let i = 0; i < scopes.length; i += 2) {
+      this.builtInClassNamesByScopeId.set(scopes[i], classNameForBuiltInFlags(scopes[i + 1]))
     }
   }
 
@@ -777,36 +554,12 @@ class DisplayLayer {
   }
 
   bufferWillChange (change) {
-    const lineCount = this.buffer.getLineCount()
-    let endRow = change.oldRange.end.row
-    while (endRow + 1 < lineCount && this.buffer.lineLengthForRow(endRow + 1) === 0) {
-      endRow++
-    }
-    this.populateSpatialIndexIfNeeded(endRow + 1, Infinity)
+    this.nativeDisplayLayer.bufferWillChange(change.oldRange.end.row)
   }
 
   bufferDidChange ({oldRange, newRange}) {
-    let startRow = oldRange.start.row
-    let oldEndRow = oldRange.end.row
-    let newEndRow = newRange.end.row
-
-    // Indent guides on sequences of blank lines are affected by the content of
-    // adjacent lines.
-    if (this.showIndentGuides) {
-      while (startRow > 0) {
-        if (this.buffer.lineLengthForRow(startRow - 1) > 0) break
-        startRow--
-      }
-
-      while (newEndRow < this.buffer.getLastRow()) {
-        if (this.buffer.lineLengthForRow(newEndRow + 1) > 0) break
-        oldEndRow++
-        newEndRow++
-      }
-    }
-
-    this.indexedBufferRowCount += newEndRow - oldEndRow
-    this.didChange(this.updateSpatialIndex(startRow, oldEndRow + 1, newEndRow + 1, Infinity))
+    this.nativeDisplayLayer.bufferDidChange(oldRange.start.row, oldRange.end.row, newRange.end.row)
+    this.didChange(this.readScreenChange())
   }
 
   didChange ({start, oldExtent, newExtent}) {
@@ -832,345 +585,40 @@ class DisplayLayer {
     })
   }
 
-  updateSpatialIndex (startBufferRow, oldEndBufferRow, newEndBufferRow, endScreenRow, deadline = NullDeadline) {
-    const originalOldEndBufferRow = oldEndBufferRow
-    startBufferRow = this.findBoundaryPrecedingBufferRow(startBufferRow)
-    oldEndBufferRow = this.findBoundaryFollowingBufferRow(oldEndBufferRow)
-    newEndBufferRow += (oldEndBufferRow - originalOldEndBufferRow)
+  updateSpatialIndex (startBufferRow, oldEndBufferRow, newEndBufferRow, endScreenRow) {
+    this.nativeDisplayLayer.updateSpatialIndex(startBufferRow, oldEndBufferRow, newEndBufferRow, endScreenRow)
+    return this.readScreenChange()
+  }
 
-    const startScreenRow = this.translateBufferPositionWithSpatialIndex({row: startBufferRow, column: 0}, 'backward').row
-    const oldEndScreenRow = this.translateBufferPositionWithSpatialIndex({row: oldEndBufferRow, column: 0}, 'backward').row
-    this.spatialIndex.spliceOld(
-      {row: startBufferRow, column: 0},
-      {row: oldEndBufferRow - startBufferRow, column: 0},
-      {row: newEndBufferRow - startBufferRow, column: 0}
-    )
-
-    const folds = this.computeFoldsInBufferRowRange(startBufferRow, newEndBufferRow)
-
-    const insertedScreenLineLengths = []
-    const insertedTabCounts = []
-    const currentScreenLineTabColumns = []
-    let rightmostInsertedScreenPosition = Point(0, -1)
-    let bufferRow = startBufferRow
-    let screenRow = startScreenRow
-    let bufferColumn = 0
-    let unexpandedScreenColumn = 0
-    let expandedScreenColumn = 0
-
-    while (true) {
-      if (bufferRow >= newEndBufferRow) break
-      if (screenRow >= endScreenRow && bufferColumn === 0) break
-      if (deadline.timeRemaining() < 2) break
-      let bufferLine = this.buffer.lineForRow(bufferRow)
-      if (bufferLine == null) break
-      let bufferLineLength = bufferLine.length
-      currentScreenLineTabColumns.length = 0
-      let screenLineWidth = 0
-      let lastWrapBoundaryUnexpandedScreenColumn = 0
-      let lastWrapBoundaryExpandedScreenColumn = 0
-      let lastWrapBoundaryScreenLineWidth = 0
-      let firstNonWhitespaceScreenColumn = -1
-
-      while (bufferColumn <= bufferLineLength) {
-        const foldEnd = folds[bufferRow] && folds[bufferRow][bufferColumn]
-        const previousCharacter = bufferLine[bufferColumn - 1]
-        const character = foldEnd ? this.foldCharacter : bufferLine[bufferColumn]
-
-        // Are we in leading whitespace? If yes, record the *end* of the leading
-        // whitespace if we've reached a non whitespace character. If no, record
-        // the current column if it is a viable soft wrap boundary.
-        if (firstNonWhitespaceScreenColumn < 0) {
-          if (character !== ' ' && character !== '\t') {
-            firstNonWhitespaceScreenColumn = expandedScreenColumn
-          }
-        } else {
-          if (previousCharacter &&
-              character &&
-              this.isWrapBoundary(previousCharacter, character)) {
-            lastWrapBoundaryUnexpandedScreenColumn = unexpandedScreenColumn
-            lastWrapBoundaryExpandedScreenColumn = expandedScreenColumn
-            lastWrapBoundaryScreenLineWidth = screenLineWidth
-          }
-        }
-
-        // Determine the on-screen width of the character for soft-wrap calculations
-        let characterWidth
-        if (character === '\t') {
-          const distanceToNextTabStop = this.tabLength - (expandedScreenColumn % this.tabLength)
-          characterWidth = this.ratioForCharacter(' ') * distanceToNextTabStop
-        } else if (character) {
-          characterWidth = this.ratioForCharacter(character)
-        } else {
-          characterWidth = 0
-        }
-
-        const insertSoftLineBreak =
-          screenLineWidth > 0 && characterWidth > 0 &&
-          screenLineWidth + characterWidth > this.softWrapColumn &&
-          previousCharacter && character &&
-          !isCharacterPair(previousCharacter, character)
-
-        if (insertSoftLineBreak) {
-          let indentLength = (firstNonWhitespaceScreenColumn < this.softWrapColumn)
-            ? Math.max(0, firstNonWhitespaceScreenColumn)
-            : 0
-          if (indentLength + this.softWrapHangingIndent < this.softWrapColumn) {
-            indentLength += this.softWrapHangingIndent
-          }
-
-          const unexpandedWrapColumn = lastWrapBoundaryUnexpandedScreenColumn || unexpandedScreenColumn
-          const expandedWrapColumn = lastWrapBoundaryExpandedScreenColumn || expandedScreenColumn
-          const wrapWidth = lastWrapBoundaryScreenLineWidth || screenLineWidth
-          this.spatialIndex.splice(
-            Point(screenRow, unexpandedWrapColumn),
-            Point.ZERO,
-            Point(1, indentLength)
-          )
-
-          insertedScreenLineLengths.push(expandedWrapColumn)
-          if (expandedWrapColumn > rightmostInsertedScreenPosition.column) {
-            rightmostInsertedScreenPosition.row = screenRow
-            rightmostInsertedScreenPosition.column = expandedWrapColumn
-          }
-          screenRow++
-
-          // To determine the expanded screen column following the wrap, we need
-          // to re-expand each tab following the wrap boundary, because tabs may
-          // take on different lengths due to starting at different screen columns.
-          let unexpandedScreenColumnAfterLastTab = indentLength
-          let expandedScreenColumnAfterLastTab = indentLength
-          let tabCountPrecedingWrap = 0
-          for (let i = 0; i < currentScreenLineTabColumns.length; i++) {
-            const tabColumn = currentScreenLineTabColumns[i]
-            if (tabColumn < unexpandedWrapColumn) {
-              tabCountPrecedingWrap++
-            } else {
-              const tabColumnAfterWrap = indentLength + tabColumn - unexpandedWrapColumn
-              expandedScreenColumnAfterLastTab += (tabColumnAfterWrap - unexpandedScreenColumnAfterLastTab)
-              expandedScreenColumnAfterLastTab += this.tabLength - (expandedScreenColumnAfterLastTab % this.tabLength)
-              unexpandedScreenColumnAfterLastTab = tabColumnAfterWrap + 1
-              currentScreenLineTabColumns[i - tabCountPrecedingWrap] = tabColumnAfterWrap
-            }
-          }
-          insertedTabCounts.push(tabCountPrecedingWrap)
-          currentScreenLineTabColumns.length -= tabCountPrecedingWrap
-
-          unexpandedScreenColumn = unexpandedScreenColumn - unexpandedWrapColumn + indentLength
-          expandedScreenColumn = expandedScreenColumnAfterLastTab + unexpandedScreenColumn - unexpandedScreenColumnAfterLastTab
-          screenLineWidth = (indentLength * this.ratioForCharacter(' ')) + (screenLineWidth - wrapWidth)
-
-          lastWrapBoundaryUnexpandedScreenColumn = 0
-          lastWrapBoundaryExpandedScreenColumn = 0
-          lastWrapBoundaryScreenLineWidth = 0
-        }
-
-        // If there is a fold at this position, splice it into the spatial index
-        // and jump to the end of the fold.
-        if (foldEnd) {
-          this.spatialIndex.splice(
-            {row: screenRow, column: unexpandedScreenColumn},
-            traversal(foldEnd, {row: bufferRow, column: bufferColumn}),
-            {row: 0, column: 1}
-          )
-          unexpandedScreenColumn++
-          expandedScreenColumn++
-          screenLineWidth += characterWidth
-          bufferRow = foldEnd.row
-          bufferColumn = foldEnd.column
-          bufferLine = this.buffer.lineForRow(bufferRow)
-          bufferLineLength = bufferLine.length
-        } else {
-          // If there is no fold at this position, check if we need to handle
-          // a hard tab at this position and advance by a single buffer column.
-          if (character === '\t') {
-            currentScreenLineTabColumns.push(unexpandedScreenColumn)
-            const distanceToNextTabStop = this.tabLength - (expandedScreenColumn % this.tabLength)
-            expandedScreenColumn += distanceToNextTabStop
-            screenLineWidth += distanceToNextTabStop * this.ratioForCharacter(' ')
-          } else {
-            expandedScreenColumn++
-            screenLineWidth += characterWidth
-          }
-          unexpandedScreenColumn++
-          bufferColumn++
-        }
-      }
-
-      expandedScreenColumn--
-      insertedScreenLineLengths.push(expandedScreenColumn)
-      insertedTabCounts.push(currentScreenLineTabColumns.length)
-      if (expandedScreenColumn > rightmostInsertedScreenPosition.column) {
-        rightmostInsertedScreenPosition.row = screenRow
-        rightmostInsertedScreenPosition.column = expandedScreenColumn
-      }
-
-      bufferRow++
-      bufferColumn = 0
-
-      screenRow++
-      unexpandedScreenColumn = 0
-      expandedScreenColumn = 0
-    }
-
-    if (bufferRow > this.indexedBufferRowCount) {
-      this.indexedBufferRowCount = bufferRow
-      if (bufferRow === this.buffer.getLineCount()) {
-        this.spatialIndex.rebalance()
-      }
-    }
-
-    const oldScreenRowCount = oldEndScreenRow - startScreenRow
-    spliceArray(
-      this.screenLineLengths,
-      startScreenRow,
-      oldScreenRowCount,
-      insertedScreenLineLengths
-    )
-    spliceArray(
-      this.tabCounts,
-      startScreenRow,
-      oldScreenRowCount,
-      insertedTabCounts
-    )
-
-    const lastRemovedScreenRow = startScreenRow + oldScreenRowCount
-    if (rightmostInsertedScreenPosition.column > this.rightmostScreenPosition.column) {
-      this.rightmostScreenPosition = rightmostInsertedScreenPosition
-    } else if (lastRemovedScreenRow < this.rightmostScreenPosition.row) {
-      this.rightmostScreenPosition.row += insertedScreenLineLengths.length - oldScreenRowCount
-    } else if (startScreenRow <= this.rightmostScreenPosition.row) {
-      this.rightmostScreenPosition = Point(0, 0)
-      for (let row = 0, rowCount = this.screenLineLengths.length; row < rowCount; row++) {
-        if (this.screenLineLengths[row] > this.rightmostScreenPosition.column) {
-          this.rightmostScreenPosition.row = row
-          this.rightmostScreenPosition.column = this.screenLineLengths[row]
-        }
-      }
-    }
-
-    spliceArray(
-      this.cachedScreenLines,
-      startScreenRow,
-      oldScreenRowCount,
-      new Array(insertedScreenLineLengths.length)
-    )
-
+  // Reads a screen-row change written to the scratch array by the native
+  // layer and applies it to our screen line objects.
+  readScreenChange () {
+    const start = this.scratch[0]
+    const oldRowCount = this.scratch[1]
+    const newRowCount = this.scratch[2]
+    spliceArray(this.cachedScreenLines, start, oldRowCount, new Array(newRowCount))
     return {
-      start: Point(startScreenRow, 0),
-      oldExtent: Point(oldScreenRowCount, 0),
-      newExtent: Point(insertedScreenLineLengths.length, 0)
+      start: Point(start, 0),
+      oldExtent: Point(oldRowCount, 0),
+      newExtent: Point(newRowCount, 0)
     }
   }
 
-  populateSpatialIndexIfNeeded (endBufferRow, endScreenRow, deadline = NullDeadline) {
-    endBufferRow = Math.min(this.buffer.getLineCount(), endBufferRow)
-    if (endBufferRow > this.indexedBufferRowCount && endScreenRow > this.screenLineLengths.length) {
-      this.updateSpatialIndex(
-        this.indexedBufferRowCount,
-        endBufferRow,
-        endBufferRow,
-        endScreenRow,
-        deadline
-      )
-    }
+  populateSpatialIndexIfNeeded (endBufferRow, endScreenRow) {
+    this.nativeDisplayLayer.populateSpatialIndexIfNeeded(endBufferRow, endScreenRow)
   }
 
   findBoundaryPrecedingBufferRow (bufferRow) {
-    while (true) {
-      if (bufferRow === 0) return 0
-      let screenPosition = this.translateBufferPositionWithSpatialIndex(Point(bufferRow, 0), 'backward')
-      let bufferPosition = this.translateScreenPositionWithSpatialIndex(Point(screenPosition.row, 0), 'backward', false)
-      if (screenPosition.column === 0 && bufferPosition.column === 0) {
-        return bufferPosition.row
-      } else {
-        bufferRow = bufferPosition.row
-      }
-    }
+    return this.nativeDisplayLayer.findBoundaryPrecedingBufferRow(bufferRow)
   }
 
   findBoundaryFollowingBufferRow (bufferRow) {
-    while (true) {
-      let screenPosition = this.translateBufferPositionWithSpatialIndex(Point(bufferRow, 0), 'forward')
-      if (screenPosition.column === 0) {
-        return bufferRow
-      } else {
-        const endOfScreenRow = Point(
-          screenPosition.row,
-          this.screenLineLengths[screenPosition.row]
-        )
-        bufferRow = this.translateScreenPositionWithSpatialIndex(endOfScreenRow, 'forward', false).row + 1
-      }
-    }
+    return this.nativeDisplayLayer.findBoundaryFollowingBufferRow(bufferRow)
   }
 
   findBoundaryFollowingScreenRow (screenRow) {
-    while (true) {
-      let bufferPosition = this.translateScreenPositionWithSpatialIndex(Point(screenRow, 0), 'forward')
-      if (bufferPosition.column === 0) {
-        return [bufferPosition.row, screenRow]
-      } else {
-        const endOfBufferRow = Point(
-          bufferPosition.row,
-          this.buffer.lineLengthForRow(bufferPosition.row)
-        )
-        screenRow = this.translateBufferPositionWithSpatialIndex(endOfBufferRow, 'forward').row + 1
-      }
-    }
-  }
-
-  // Returns a map describing fold starts and ends, structured as
-  // fold start row -> fold start column -> fold end point
-  computeFoldsInBufferRowRange (startBufferRow, endBufferRow) {
-    const folds = {}
-    const foldMarkers = this.foldsMarkerLayer.findMarkers({
-      intersectsRowRange: [startBufferRow, endBufferRow - 1]
-    })
-
-    // If the given buffer range exceeds the indexed range, we need to ensure
-    // we consider any folds that intersect the combined row range of the
-    // initially-queried folds, since we couldn't use the index to expand the
-    // row range to account for these extra folds ahead of time.
-    if (endBufferRow >= this.indexedBufferRowCount) {
-      for (let i = 0; i < foldMarkers.length; i++) {
-        const marker = foldMarkers[i]
-        const nextMarker = foldMarkers[i + 1]
-        if (marker.getEndPosition().row >= endBufferRow &&
-            (!nextMarker || nextMarker.getEndPosition().row < marker.getEndPosition().row)) {
-          const intersectingMarkers = this.foldsMarkerLayer.findMarkers({
-            intersectsRow: marker.getEndPosition().row
-          })
-          endBufferRow = marker.getEndPosition().row + 1
-          foldMarkers.splice(i, foldMarkers.length - i, ...intersectingMarkers)
-        }
-      }
-    }
-
-    for (let i = 0; i < foldMarkers.length; i++) {
-      const foldStart = foldMarkers[i].getStartPosition()
-      let foldEnd = foldMarkers[i].getEndPosition()
-
-      // Merge overlapping folds
-      while (i < foldMarkers.length - 1) {
-        const nextFoldMarker = foldMarkers[i + 1]
-        if (compare(nextFoldMarker.getStartPosition(), foldEnd) < 0) {
-          if (compare(foldEnd, nextFoldMarker.getEndPosition()) < 0) {
-            foldEnd = nextFoldMarker.getEndPosition()
-          }
-          i++
-        } else {
-          break
-        }
-      }
-
-      // Add non-empty folds to the returned result
-      if (compare(foldStart, foldEnd) < 0) {
-        if (!folds[foldStart.row]) folds[foldStart.row] = {}
-        folds[foldStart.row][foldStart.column] = foldEnd
-      }
-    }
-
-    return folds
+    this.nativeDisplayLayer.findBoundaryFollowingScreenRow(screenRow)
+    return [this.scratch[0], this.scratch[1]]
   }
 
   setParams (params) {
@@ -1213,6 +661,15 @@ class DisplayLayer {
       paramsChanged = true
       this.isWrapBoundary = params.isWrapBoundary
     }
+    if (params.hasOwnProperty('characterWidthRatios') &&
+        !characterWidthRatiosEqual(params.characterWidthRatios, this.characterWidthRatios)) {
+      paramsChanged = true
+      this.characterWidthRatios = params.characterWidthRatios
+    }
+    if (params.hasOwnProperty('wrapBoundaryMode') && params.wrapBoundaryMode !== this.wrapBoundaryMode) {
+      paramsChanged = true
+      this.wrapBoundaryMode = params.wrapBoundaryMode
+    }
     if (params.hasOwnProperty('foldCharacter') && params.foldCharacter !== this.foldCharacter) {
       paramsChanged = true
       this.foldCharacter = params.foldCharacter
@@ -1221,12 +678,30 @@ class DisplayLayer {
       paramsChanged = true
       this.atomicSoftTabs = params.atomicSoftTabs
     }
+    if (paramsChanged) this.nativeDisplayLayer.setParams(this.getNativeParams())
     return paramsChanged
   }
+}
 
-  isSoftWrapHunk (hunk) {
-    return isEqual(hunk.oldStart, hunk.oldEnd)
-  }
+function clipDirectionCode (options) {
+  const code = options && CLIP_DIRECTION_CODES[options.clipDirection]
+  return code != null ? code : 0
+}
+
+function encodeCoordinate (value) {
+  return Number.isFinite(value) ? value : -1
+}
+
+function classNameForBuiltInFlags (flags) {
+  let className = ''
+  if (flags & INVISIBLE_CHARACTER) className += 'invisible-character '
+  if (flags & HARD_TAB) className += 'hard-tab '
+  if (flags & LEADING_WHITESPACE) className += 'leading-whitespace '
+  if (flags & TRAILING_WHITESPACE) className += 'trailing-whitespace '
+  if (flags & LINE_ENDING) className += 'eol '
+  if (flags & INDENT_GUIDE) className += 'indent-guide '
+  if (flags & FOLD) className += 'fold-marker '
+  return className.trim()
 }
 
 function invisiblesEqual (left, right) {
@@ -1239,6 +714,13 @@ function invisiblesEqual (left, right) {
   return true
 }
 
+function characterWidthRatiosEqual (left, right) {
+  if (left == null || right == null) return left == right
+  return left.doubleWidth === right.doubleWidth &&
+    left.halfWidth === right.halfWidth &&
+    left.korean === right.korean
+}
+
 function isWordStart (previousCharacter, character) {
   return (previousCharacter === ' ' || previousCharacter === '\t') &&
     (character !== ' ' && character !== '\t')
@@ -1246,11 +728,6 @@ function isWordStart (previousCharacter, character) {
 
 function unitRatio () {
   return 1
-}
-
-const NullDeadline = {
-  didTimeout: false,
-  timeRemaining () { return Infinity }
 }
 
 module.exports = DisplayLayer
